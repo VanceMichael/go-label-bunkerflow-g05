@@ -13,8 +13,14 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	attemptStarted = "started"
+	attemptCharged = "charged"
+	attemptFailed  = "failed"
+)
+
 type Gateway interface {
-	Charge(context.Context, string, int64) error
+	Charge(ctx context.Context, key string, amount int64) (string, error)
 }
 type Service struct {
 	Store   *storage.Store
@@ -28,19 +34,19 @@ type LocalGateway struct {
 	Charges map[string]int
 }
 
-func (g *LocalGateway) Charge(ctx context.Context, key string, amount int64) error {
+func (g *LocalGateway) Charge(ctx context.Context, key string, amount int64) (string, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return "", err
 	}
 	if g.Charges == nil {
 		g.Charges = map[string]int{}
 	}
 	g.Charges[key]++
 	if g.Fail {
-		return domain.ErrUnavailable
+		return "", domain.ErrUnavailable
 	}
 	_ = amount
-	return nil
+	return "gateway-ref-" + key, nil
 }
 
 func New(store *storage.Store, auditSvc *audit.Service, outboxSvc *outbox.Service) *Service {
@@ -79,6 +85,9 @@ func (s *Service) Pay(ctx context.Context, actor domain.Actor, invoiceID, paymen
 	if paymentKey == "" {
 		return domain.ErrInvalid
 	}
+
+	// Pre-check the invoice so a missing/conflicting invoice is reported
+	// before any gateway interaction, matching the prior behavior.
 	var amount int64
 	var state string
 	if err := s.Store.DB.QueryRowContext(ctx, `SELECT i.amount_cents,i.state FROM invoices i JOIN transfer_orders o ON o.id=i.order_id WHERE i.id=? AND o.tenant_id=?`, invoiceID, actor.TenantID).Scan(&amount, &state); err == sql.ErrNoRows {
@@ -92,9 +101,77 @@ func (s *Service) Pay(ctx context.Context, actor domain.Actor, invoiceID, paymen
 	if state != "issued" {
 		return domain.ErrConflict
 	}
-	if err := s.Gateway.Charge(ctx, paymentKey, amount); err != nil {
-		return fmt.Errorf("charge gateway: %w", err)
+
+	// Recoverable idempotent flow keyed on paymentKey. The gateway debit is
+	// external and cannot be rolled back, so we persist the fact that the
+	// gateway accepted a charge for this key *before* mutating the invoice.
+	// If local bookkeeping (audit/outbox) then fails and the caller retries
+	// with the same key, the recorded "charged" attempt lets us reconcile
+	// (mark invoice paid, audit, enqueue) without charging the gateway again.
+	if err := s.chargeOrRecover(ctx, actor, invoiceID, paymentKey, amount, requestID); err != nil {
+		return err
 	}
+	return s.reconcile(ctx, actor, invoiceID, paymentKey, requestID)
+}
+
+// chargeOrRecover records the gateway debit. On a retry with the same key it
+// is a no-op when a charge was already recorded; a prior failed attempt is
+// recovered by recharging, since the gateway is idempotent on the payment key
+// and a replayed charge is not a double debit.
+func (s *Service) chargeOrRecover(ctx context.Context, actor domain.Actor, invoiceID, paymentKey string, amount int64, requestID string) error {
+	var chargeErr error
+	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+		var attemptID, attemptState string
+		var attemptAmount int64
+		err := tx.QueryRowContext(ctx, `SELECT id,state,amount_cents FROM payment_attempts WHERE tenant_id=? AND payment_key=?`, actor.TenantID, paymentKey).Scan(&attemptID, &attemptState, &attemptAmount)
+		switch {
+		case err == nil:
+			if attemptAmount != amount {
+				return fmt.Errorf("%w: payment key reused for different amount", domain.ErrIdempotency)
+			}
+			if attemptState == attemptCharged {
+				return nil
+			}
+			// Fall through to (re)charge: a "started" or "failed" attempt means
+			// the gateway outcome for this key is not confirmed locally.
+		case err == sql.ErrNoRows:
+			attemptID = fmt.Sprintf("pay-%s", uuid.NewString())
+			if _, err := tx.ExecContext(ctx, `INSERT INTO payment_attempts(id,tenant_id,invoice_id,payment_key,amount_cents,state,created_at) VALUES (?,?,?,?,?,?,?)`, attemptID, actor.TenantID, invoiceID, paymentKey, amount, attemptStarted, storage.StringTime(time.Now())); err != nil {
+				return err
+			}
+		default:
+			return err
+		}
+
+		gatewayRef, gerr := s.Gateway.Charge(ctx, paymentKey, amount)
+		if gerr != nil {
+			// Persist the failed outcome for diagnostics/retry history, then
+			// surface the error. Committing the record (rather than rolling
+			// back) lets an operator see why a payment key was retried.
+			if _, uerr := tx.ExecContext(ctx, `UPDATE payment_attempts SET state=?,error=? WHERE id=?`, attemptFailed, gerr.Error(), attemptID); uerr != nil {
+				return uerr
+			}
+			chargeErr = gerr
+			return nil
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE payment_attempts SET state=?,gateway_ref=? WHERE id=?`, attemptCharged, gatewayRef, attemptID); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if chargeErr != nil {
+		return fmt.Errorf("charge gateway: %w", chargeErr)
+	}
+	return nil
+}
+
+// reconcile marks the invoice paid and records the local bookkeeping. It is
+// idempotent: if it fails and the caller retries, chargeOrRecover is a no-op
+// (charge already recorded) and reconcile runs again from the same state.
+func (s *Service) reconcile(ctx context.Context, actor domain.Actor, invoiceID, paymentKey, requestID string) error {
 	return s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `UPDATE invoices SET state='paid',payment_key=? WHERE id=? AND state='issued'`, paymentKey, invoiceID)
 		if err != nil {
@@ -102,7 +179,8 @@ func (s *Service) Pay(ctx context.Context, actor domain.Actor, invoiceID, paymen
 		}
 		n, _ := result.RowsAffected()
 		if n != 1 {
-			return domain.ErrConflict
+			// Invoice is already paid (concurrent success or successful retry).
+			return nil
 		}
 		if err := s.Audit.Record(ctx, tx, actor, "invoice.paid", invoiceID, requestID); err != nil {
 			return err
