@@ -35,12 +35,12 @@ func (s *Service) Get(ctx context.Context, actor domain.Actor, id string) (domai
 }
 
 func (s *Service) Archive(ctx context.Context, actor domain.Actor, id string) error {
-	active, err := (ArchiveGuard{DB: s.Store.DB}).BlockingResources(ctx, id)
+	active, err := (ArchiveGuard{DB: s.Store.DB}).BlockingResources(ctx, actor.TenantID, id)
 	if err != nil {
 		return err
 	}
 	if active > 0 {
-		return fmt.Errorf("%w: terminal has active windows", domain.ErrTerminalBusy)
+		return fmt.Errorf("%w: terminal has running resources", domain.ErrTerminalBusy)
 	}
 	result, err := s.Store.DB.ExecContext(ctx, `UPDATE terminals SET status='archived' WHERE id=? AND tenant_id=? AND status='active'`, id, actor.TenantID)
 	if err != nil {
