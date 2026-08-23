@@ -61,9 +61,6 @@ func (s *Service) Claim(ctx context.Context, worker string, now time.Time) (doma
 }
 
 func (s *Service) Publish(ctx context.Context, item domain.OutboxMessage, worker string, now time.Time) error {
-	if err := markSentBeforeDelivery(ctx, s.Store.DB, item.ID, worker); err != nil {
-		return err
-	}
 	if s.Store.Hooks.PublishStarted != nil {
 		close(s.Store.Hooks.PublishStarted)
 	}
@@ -71,12 +68,16 @@ func (s *Service) Publish(ctx context.Context, item domain.OutboxMessage, worker
 		select {
 		case <-s.Store.Hooks.PublishRelease:
 		case <-ctx.Done():
-			return fmt.Errorf("%w: publish cancelled", domain.ErrCancelled)
+			return s.Fail(ctx, item, worker, now, fmt.Errorf("%w: publish cancelled", domain.ErrCancelled))
 		}
 	}
 	if s.Store.Hooks.FailBroker {
 		return s.Fail(ctx, item, worker, now, domain.ErrUnavailable)
 	}
+	// Only mark the message as sent once downstream delivery is confirmed.
+	// Marking it earlier leaves the row with no lease owner, so a broker
+	// failure cannot be rolled back to pending and the worker can never
+	// reclaim the message.
 	result, err := s.Store.DB.ExecContext(ctx, `UPDATE outbox_messages SET status='sent', lease_owner=NULL, lease_until=NULL WHERE id=? AND lease_owner=?`, item.ID, worker)
 	if err != nil {
 		return err
