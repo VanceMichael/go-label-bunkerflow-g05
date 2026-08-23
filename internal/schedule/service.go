@@ -79,17 +79,14 @@ func (s *Service) ClaimWindow(ctx context.Context, actor domain.Actor, windowID 
 }
 
 func (s *Service) CancelWindow(ctx context.Context, actor domain.Actor, windowID, requestID string) error {
-	if _, err := s.Store.DB.ExecContext(ctx, `UPDATE bunker_windows SET status='cancelled', owner_id=NULL, version=version+1 WHERE id=? AND tenant_id=?`, windowID, actor.TenantID); err != nil {
-		return err
-	}
-	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+	return s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		var status string
 		if err := tx.QueryRowContext(ctx, `SELECT status FROM bunker_windows WHERE id=? AND tenant_id=?`, windowID, actor.TenantID).Scan(&status); err == sql.ErrNoRows {
 			return domain.ErrNotFound
 		} else if err != nil {
 			return err
 		}
-		if status == "released" {
+		if status == "released" || status == "cancelled" {
 			return nil
 		}
 		var active int
@@ -99,13 +96,18 @@ func (s *Service) CancelWindow(ctx context.Context, actor domain.Actor, windowID
 		if active > 0 {
 			return fmt.Errorf("%w: active transfer", domain.ErrConflict)
 		}
-		_ = status
+		result, err := tx.ExecContext(ctx, `UPDATE bunker_windows SET status='cancelled', owner_id=NULL, version=version+1 WHERE id=? AND tenant_id=?`, windowID, actor.TenantID)
+		if err != nil {
+			return err
+		}
+		if n, _ := result.RowsAffected(); n != 1 {
+			return domain.ErrNotFound
+		}
 		if err := s.Audit.Record(ctx, tx, actor, "window.cancelled", windowID, requestID); err != nil {
 			return err
 		}
 		return s.Outbox.Enqueue(ctx, tx, actor.TenantID, "window.cancelled", windowID)
 	})
-	return err
 }
 
 func (s *Service) Get(ctx context.Context, actor domain.Actor, id string) (domain.BunkerWindow, error) {
