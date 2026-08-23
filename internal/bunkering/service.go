@@ -245,10 +245,10 @@ func (s *Service) CompleteStep(ctx context.Context, actor domain.Actor, orderID 
 
 func (s *Service) Complete(ctx context.Context, actor domain.Actor, orderID string, requestID string) (domain.Invoice, error) {
 	var invoice domain.Invoice
-	err := s.Store.WithCommittedPrelude(ctx, func(ctx context.Context, db *sql.DB) error {
+	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		var state string
 		var preTarget float64
-		if err := db.QueryRowContext(ctx, `SELECT state,target_kg FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&state, &preTarget); err == sql.ErrNoRows {
+		if err := tx.QueryRowContext(ctx, `SELECT state,target_kg FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&state, &preTarget); err == sql.ErrNoRows {
 			return domain.ErrNotFound
 		} else if err != nil {
 			return err
@@ -256,7 +256,7 @@ func (s *Service) Complete(ctx context.Context, actor domain.Actor, orderID stri
 		if state != string(domain.StateSampled) {
 			return fmt.Errorf("%w: order not sampled", domain.ErrConflict)
 		}
-		approved, err := s.Quality.ApprovedForOrder(ctx, db, orderID)
+		approved, err := s.Quality.ApprovedForOrder(ctx, tx, orderID)
 		if err != nil {
 			return err
 		}
@@ -264,12 +264,17 @@ func (s *Service) Complete(ctx context.Context, actor domain.Actor, orderID stri
 			return domain.ErrNoQuality
 		}
 		invoice = domain.Invoice{ID: uuid.NewString(), OrderID: orderID, Amount: int64(preTarget * 120), Currency: "USD", State: "issued"}
-		if _, err := db.ExecContext(ctx, `UPDATE transfer_orders SET state='completed',transferred_kg=? WHERE id=? AND tenant_id=? AND state='sampled'`, preTarget, orderID, actor.TenantID); err != nil {
+		result, err := tx.ExecContext(ctx, `UPDATE transfer_orders SET state='completed',transferred_kg=? WHERE id=? AND tenant_id=? AND state='sampled'`, preTarget, orderID, actor.TenantID)
+		if err != nil {
 			return err
 		}
-		_, err = db.ExecContext(ctx, `INSERT INTO invoices(id,order_id,amount_cents,currency,state,created_at) VALUES (?,?,?,?,?,?)`, invoice.ID, invoice.OrderID, invoice.Amount, invoice.Currency, invoice.State, storage.StringTime(time.Now()))
-		return err
-	}, func(tx *sql.Tx) error {
+		n, _ := result.RowsAffected()
+		if n != 1 {
+			return fmt.Errorf("%w: order not sampled", domain.ErrConflict)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO invoices(id,order_id,amount_cents,currency,state,created_at) VALUES (?,?,?,?,?,?)`, invoice.ID, invoice.OrderID, invoice.Amount, invoice.Currency, invoice.State, storage.StringTime(time.Now())); err != nil {
+			return err
+		}
 		if err := s.Audit.Record(ctx, tx, actor, "bunkering.completed", orderID, requestID); err != nil {
 			return err
 		}
