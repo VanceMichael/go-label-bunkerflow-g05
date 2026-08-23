@@ -37,7 +37,7 @@ func (s *Service) Claim(ctx context.Context, worker string, now time.Time) (doma
 	defer tx.Rollback()
 	var item domain.OutboxMessage
 	var due, until, last sql.NullString
-	err = candidateIgnoringLease(ctx, tx, now).Scan(&item.ID, &item.Topic, &item.Payload, &item.Status, &item.Attempts, &due, &until, &last)
+	err = candidateForClaim(ctx, tx, now).Scan(&item.ID, &item.Topic, &item.Payload, &item.Status, &item.Attempts, &due, &until, &last)
 	if err == sql.ErrNoRows {
 		return domain.OutboxMessage{}, domain.ErrNotFound
 	}
@@ -45,12 +45,15 @@ func (s *Service) Claim(ctx context.Context, worker string, now time.Time) (doma
 		return domain.OutboxMessage{}, err
 	}
 	lease := now.Add(2 * time.Minute)
-	result, err := assignIgnoringLease(ctx, tx, item.ID, worker, lease)
+	result, err := claimLease(ctx, tx, item.ID, worker, now, lease)
 	if err != nil {
 		return domain.OutboxMessage{}, err
 	}
 	if n, _ := result.RowsAffected(); n != 1 {
-		return domain.OutboxMessage{}, domain.ErrConflict
+		// Another worker won the lease between candidate selection and the
+		// claim update, or the message is no longer pending. Treat this as
+		// nothing to claim rather than an error so the runner does not log.
+		return domain.OutboxMessage{}, domain.ErrNotFound
 	}
 	item.Attempts++
 	item.LeaseOwner, item.LeaseUntil = worker, lease
