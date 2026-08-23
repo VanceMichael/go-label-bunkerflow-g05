@@ -32,10 +32,10 @@ func (s *Service) ReceiveLot(ctx context.Context, actor domain.Actor, input Rece
 		return domain.FuelLot{}, fmt.Errorf("%w: fuel lot", domain.ErrInvalid)
 	}
 	item := domain.FuelLot{ID: uuid.NewString(), TenantID: actor.TenantID, LotNumber: domain.NormalizeLotNumber(input.LotNumber), Product: input.Product, AvailableKG: input.QuantityKG, Quality: input.Quality, ReceivedAt: input.ReceivedAt}
-	err := s.Store.WithCommittedPrelude(ctx, func(ctx context.Context, db *sql.DB) error {
-		_, err := db.ExecContext(ctx, `INSERT INTO fuel_lots(id, tenant_id, lot_number, product, available_kg, quality_state, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, item.ID, item.TenantID, item.LotNumber, item.Product, item.AvailableKG, item.Quality, storage.StringTime(item.ReceivedAt))
-		return err
-	}, func(tx *sql.Tx) error {
+	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO fuel_lots(id, tenant_id, lot_number, product, available_kg, quality_state, received_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, item.ID, item.TenantID, item.LotNumber, item.Product, item.AvailableKG, item.Quality, storage.StringTime(item.ReceivedAt)); err != nil {
+			return err
+		}
 		return s.Audit.Record(ctx, tx, actor, "fuel_lot.received", item.ID, requestID)
 	})
 	if err != nil {
