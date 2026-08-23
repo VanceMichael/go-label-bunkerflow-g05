@@ -9,7 +9,7 @@ import (
 	"time"
 
 	"github.com/VanceMichael/go-base-bunkerflow-g05/internal/domain"
-	_ "modernc.org/sqlite"
+	sqlite "modernc.org/sqlite"
 )
 
 //go:embed schema.sql
@@ -105,3 +105,18 @@ func ParseTime(value string) (time.Time, error) {
 }
 
 func IsMissing(err error) bool { return errors.Is(err, sql.ErrNoRows) }
+
+// IsUniqueConstraint reports whether err is a SQLite UNIQUE / PRIMARY KEY
+// constraint violation. modernc.org/sqlite exposes the extended result code on
+// *sqlite.Error (2067 = SQLITE_CONSTRAINT_UNIQUE, 1555 = PRIMARYKEY). Used to
+// turn duplicate-key races into idempotent replays instead of opaque errors.
+func IsUniqueConstraint(err error) bool {
+	var target *sqlite.Error
+	if errors.As(err, &target) {
+		switch target.Code() {
+		case 2067, 1555:
+			return true
+		}
+	}
+	return false
+}

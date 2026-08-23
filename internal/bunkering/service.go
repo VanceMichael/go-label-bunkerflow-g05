@@ -3,6 +3,8 @@ package bunkering
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -30,6 +32,14 @@ type CreateInput struct {
 	IdempotencyKey                string
 }
 
+// createRequest is the stable body fingerprinted for idempotency. It excludes
+// IdempotencyKey itself (that is the lookup identity, not part of the payload),
+// so two identical business requests under the same key hash the same.
+type createRequest struct {
+	VesselID, WindowID, FuelLotID string
+	TargetKG                      float64
+}
+
 func New(store *storage.Store, auditSvc *audit.Service, outboxSvc *outbox.Service, fuelSvc *fuel.Service, qualitySvc *quality.Service, idempotencySvc *idempotency.Service) *Service {
 	return &Service{Store: store, Audit: auditSvc, Outbox: outboxSvc, Fuel: fuelSvc, Quality: qualitySvc, Idempotency: idempotencySvc}
 }
@@ -38,8 +48,21 @@ func (s *Service) Create(ctx context.Context, actor domain.Actor, input CreateIn
 	if input.TargetKG <= 0 || input.VesselID == "" || input.WindowID == "" || input.FuelLotID == "" {
 		return domain.TransferOrder{}, domain.ErrInvalid
 	}
+	request := createRequest{VesselID: input.VesselID, WindowID: input.WindowID, FuelLotID: input.FuelLotID, TargetKG: input.TargetKG}
 	item := domain.TransferOrder{ID: uuid.NewString(), TenantID: actor.TenantID, VesselID: input.VesselID, WindowID: input.WindowID, FuelLotID: input.FuelLotID, TargetKG: input.TargetKG, State: domain.StatePlanned, Version: 1}
 	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+		// Replay first: if this key already produced an order, hand back that
+		// exact order instead of booking a second one.
+		if input.IdempotencyKey != "" && s.Idempotency != nil {
+			replayed, ok, err := idempotency.LookupOrder[domain.TransferOrder](s.Idempotency, ctx, tx, actor, input.IdempotencyKey, request)
+			if err != nil {
+				return err
+			}
+			if ok {
+				item = replayed
+				return errReplayed
+			}
+		}
 		var vesselStatus, windowStatus, qualityState string
 		if err := tx.QueryRowContext(ctx, `SELECT status FROM vessels WHERE id=? AND tenant_id=?`, item.VesselID, actor.TenantID).Scan(&vesselStatus); err == sql.ErrNoRows {
 			return domain.ErrNotFound
@@ -66,6 +89,16 @@ func (s *Service) Create(ctx context.Context, actor domain.Actor, input CreateIn
 			return fmt.Errorf("%w: fuel quality", domain.ErrNoQuality)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO transfer_orders(id, tenant_id, vessel_id, window_id, fuel_lot_id, target_kg, transferred_kg, state, version, idempotency_key, created_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`, item.ID, item.TenantID, item.VesselID, item.WindowID, item.FuelLotID, item.TargetKG, item.State, item.Version, nullable(input.IdempotencyKey), storage.StringTime(time.Now())); err != nil {
+			if storage.IsUniqueConstraint(err) && input.IdempotencyKey != "" && s.Idempotency != nil {
+				// A concurrent writer won the race for this key; replay its
+				// committed order instead of surfacing a raw constraint error.
+				if replayed, ok, lerr := idempotency.LookupOrder[domain.TransferOrder](s.Idempotency, ctx, tx, actor, input.IdempotencyKey, request); lerr != nil {
+					return lerr
+				} else if ok {
+					item = replayed
+					return errReplayed
+				}
+			}
 			return err
 		}
 		for position, name := range []string{"connect", "precheck", "transfer", "disconnect"} {
@@ -82,13 +115,27 @@ func (s *Service) Create(ctx context.Context, actor domain.Actor, input CreateIn
 		if err := s.Outbox.Enqueue(ctx, tx, actor.TenantID, "bunkering.created", item.ID); err != nil {
 			return err
 		}
+		if input.IdempotencyKey != "" && s.Idempotency != nil {
+			body, err := json.Marshal(item)
+			if err != nil {
+				return err
+			}
+			if err := s.Idempotency.Save(ctx, tx, actor, input.IdempotencyKey, request, 201, string(body)); err != nil {
+				return err
+			}
+		}
 		return nil
 	})
-	if err != nil {
+	if err != nil && !errors.Is(err, errReplayed) {
 		return domain.TransferOrder{}, err
 	}
 	return item, nil
 }
+
+// errReplayed is a sentinel returned from inside the transaction to signal that
+// item holds a previously committed order that must be returned to the caller
+// rather than treated as a failure.
+var errReplayed = errors.New("idempotency replay")
 
 func nullable(value string) any {
 	if value == "" {

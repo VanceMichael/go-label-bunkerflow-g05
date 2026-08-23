@@ -28,9 +28,18 @@ func hashRequest(value any) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func (s *Service) Lookup(ctx context.Context, q interface {
-	QueryRowContext(context.Context, string, ...any) *sql.Row
-}, actor domain.Actor, key string, request any) (*Replay, error) {
+// Querier is the subset of *sql.Tx / *sql.DB that Lookup and Save need so they
+// can run inside the caller's transaction and stay on the same atomic step as
+// the work they guard.
+type Querier interface {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+type Execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func (s *Service) Lookup(ctx context.Context, q Querier, actor domain.Actor, key string, request any) (*Replay, error) {
 	if key == "" {
 		return nil, nil
 	}
@@ -49,12 +58,29 @@ func (s *Service) Lookup(ctx context.Context, q interface {
 	return &result, nil
 }
 
-func (s *Service) Save(ctx context.Context, q interface {
-	ExecContext(context.Context, string, ...any) (sql.Result, error)
-}, actor domain.Actor, key string, request any, code int, body string) error {
+// LookupOrder is the typed convenience for create-style handlers: it confirms
+// the stored request still matches and, if so, returns the original response
+// object. A zero value with a nil error means the key has never been seen.
+func LookupOrder[T any](s *Service, ctx context.Context, q Querier, actor domain.Actor, key string, request any) (T, bool, error) {
+	var zero T
+	replay, err := s.Lookup(ctx, q, actor, key, request)
+	if err != nil || replay == nil {
+		return zero, false, err
+	}
+	var item T
+	if err := json.Unmarshal([]byte(replay.Body), &item); err != nil {
+		return zero, false, err
+	}
+	return item, true, nil
+}
+
+func (s *Service) Save(ctx context.Context, q Execer, actor domain.Actor, key string, request any, code int, body string) error {
 	if key == "" {
 		return nil
 	}
-	_, err := q.ExecContext(ctx, `INSERT INTO idempotency_keys(id, tenant_id, key_value, request_hash, response_code, response_body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)`, uuid.NewString(), actor.TenantID, key, hashRequest(request), code, body, storage.StringTime(time.Now()))
+	// A concurrent writer may have persisted the same key between our Lookup
+	// and Save. Treat that as a win for the earlier request: keep its response
+	// rather than failing the whole transaction, so a replay stays a replay.
+	_, err := q.ExecContext(ctx, `INSERT INTO idempotency_keys(id, tenant_id, key_value, request_hash, response_code, response_body, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(tenant_id, key_value) DO NOTHING`, uuid.NewString(), actor.TenantID, key, hashRequest(request), code, body, storage.StringTime(time.Now()))
 	return err
 }
