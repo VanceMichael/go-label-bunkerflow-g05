@@ -139,13 +139,22 @@ func (s *Service) MarkAlongside(ctx context.Context, actor domain.Actor, orderID
 }
 
 func (s *Service) StartTransfer(ctx context.Context, actor domain.Actor, orderID, owner string, requestID string) error {
-	if s.Store.Hooks.StartTransferStarted == nil {
-		if err := ctx.Err(); err != nil {
-			return fmt.Errorf("%w: %v", domain.ErrCancelled, err)
-		}
+	// Honour the caller's cancellation signal before any side effects, regardless
+	// of whether the detached-context (broker) hook is wired. The previous guard
+	// only checked ctx.Err() when the hook was nil, so a cancelled request whose
+	// hook was set fell through, deducted fuel, and advanced the order to
+	// "transferring" — leaving the live state at odds with the caller's intent.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrCancelled, err)
 	}
 	if s.Store.Hooks.StartTransferStarted != nil {
 		close(s.Store.Hooks.StartTransferStarted)
+	}
+	// Re-check after the hook releases: the caller may have cancelled while we
+	// were waiting. We must not commit the state transition onto a detached
+	// context once the originating request has been torn down.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %v", domain.ErrCancelled, err)
 	}
 	detached := ctx
 	if s.Store.Hooks.StartTransferStarted != nil {

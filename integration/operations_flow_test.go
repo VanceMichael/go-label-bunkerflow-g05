@@ -152,6 +152,65 @@ func TestCancelledStartTransferPreservesStateAndFuel(t *testing.T) {
 	}
 }
 
+func TestCancelledStartTransferWithHookPreservesStateAndFuel(t *testing.T) {
+	ctx := context.Background()
+	rt, err := app.New(ctx, app.Config{DatabaseURL: "file:cancel-start-hook?mode=memory&cache=shared"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rt.Shutdown(context.Background())
+	rt.Start(ctx)
+	actor := domain.Actor{ID: "user-planner", TenantID: "tenant-zj", Role: "planner"}
+	_, err = rt.Store.DB.Exec(`INSERT INTO vessels(id,tenant_id,imo,name,flag,deadweight_kg,status,created_at) VALUES ('v','tenant-zj','9384756','Atlas','CN',1000,'active',CURRENT_TIMESTAMP)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rt.Store.DB.Exec(`INSERT INTO terminals(id,tenant_id,name,timezone,open_from,open_until,status,created_at) VALUES ('t','tenant-zj','Ningbo','Asia/Shanghai','00:00','23:59','active',CURRENT_TIMESTAMP)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rt.Store.DB.Exec(`INSERT INTO bunker_windows(id,tenant_id,terminal_id,starts_at,ends_at,status,version,created_at) VALUES ('w','tenant-zj','t','2026-08-24T00:00:00Z','2026-08-24T02:00:00Z','claimed',1,CURRENT_TIMESTAMP)`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = rt.Store.DB.Exec(`INSERT INTO fuel_lots(id,tenant_id,lot_number,product,available_kg,quality_state,received_at) VALUES ('l','tenant-zj','LOT','green-methanol',1000,'approved','2026-08-23T00:00:00Z')`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	order, err := rt.Bunkering.Create(ctx, actor, bunkering.CreateInput{VesselID: "v", WindowID: "w", FuelLotID: "l", TargetKG: 100}, "req")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Bunkering.Approve(ctx, actor, order.ID, "req"); err != nil {
+		t.Fatal(err)
+	}
+	if err := rt.Bunkering.MarkAlongside(ctx, actor, order.ID, "req"); err != nil {
+		t.Fatal(err)
+	}
+	// Wire the detached-context hook so StartTransfer would otherwise run its
+	// side effects on a context.Background() and lose the cancellation signal.
+	rt.Store.Hooks.StartTransferStarted = make(chan struct{})
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := rt.Bunkering.StartTransfer(cancelled, actor, order.ID, "worker", "req"); !errors.Is(err, domain.ErrCancelled) {
+		t.Fatalf("error=%v", err)
+	}
+	stored, err := rt.Bunkering.Get(ctx, actor, order.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != domain.StateAlongside {
+		t.Fatalf("state=%s", stored.State)
+	}
+	lot, err := rt.Fuel.Get(ctx, actor, "l")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lot.AvailableKG != 1000 {
+		t.Fatalf("available=%v", lot.AvailableKG)
+	}
+}
+
 func TestTenantCannotReadAnotherTenantResources(t *testing.T) {
 	ctx := context.Background()
 	rt, err := app.New(ctx, app.Config{DatabaseURL: "file:tenant-isolation?mode=memory&cache=shared"}, nil)
