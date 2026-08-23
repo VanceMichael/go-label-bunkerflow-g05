@@ -33,10 +33,11 @@ func (s *Service) Page(ctx context.Context, actor domain.Actor, after *Cursor, l
 	}
 	query += ` ORDER BY created_at,id LIMIT ?`
 	args = append(args, limit+1)
-	rows, err := openPageRows(ctx, s.Store.DB, query, args...)
+	rows, err := s.Store.DB.QueryContext(ctx, query, args...)
 	if err != nil {
 		return Page{}, err
 	}
+	defer rows.Close()
 	items := make([]domain.AuditEvent, 0, limit)
 	for len(items) < limit && rows.Next() {
 		var item domain.AuditEvent
