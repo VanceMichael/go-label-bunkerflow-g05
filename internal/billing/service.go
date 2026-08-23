@@ -49,11 +49,10 @@ func New(store *storage.Store, auditSvc *audit.Service, outboxSvc *outbox.Servic
 
 func (s *Service) Generate(ctx context.Context, actor domain.Actor, orderID, requestID string) (domain.Invoice, error) {
 	var invoice domain.Invoice
-	writeCtx := detachedInvoiceContext(ctx)
-	err := s.Store.WithTx(writeCtx, func(tx *sql.Tx) error {
+	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		var state string
 		var target float64
-		if err := tx.QueryRowContext(writeCtx, `SELECT state,target_kg FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&state, &target); err == sql.ErrNoRows {
+		if err := tx.QueryRowContext(ctx, `SELECT state,target_kg FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&state, &target); err == sql.ErrNoRows {
 			return domain.ErrNotFound
 		} else if err != nil {
 			return err
@@ -62,13 +61,13 @@ func (s *Service) Generate(ctx context.Context, actor domain.Actor, orderID, req
 			return fmt.Errorf("%w: order not completed", domain.ErrConflict)
 		}
 		invoice = domain.Invoice{ID: uuid.NewString(), OrderID: orderID, Amount: int64(target * 120), Currency: "USD", State: "issued"}
-		if _, err := tx.ExecContext(writeCtx, `INSERT INTO invoices(id,order_id,amount_cents,currency,state,created_at) VALUES (?,?,?,?,?,?)`, invoice.ID, invoice.OrderID, invoice.Amount, invoice.Currency, invoice.State, storage.StringTime(time.Now())); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO invoices(id,order_id,amount_cents,currency,state,created_at) VALUES (?,?,?,?,?,?)`, invoice.ID, invoice.OrderID, invoice.Amount, invoice.Currency, invoice.State, storage.StringTime(time.Now())); err != nil {
 			return err
 		}
-		if err := s.Audit.Record(writeCtx, tx, actor, "invoice.issued", invoice.ID, requestID); err != nil {
+		if err := s.Audit.Record(ctx, tx, actor, "invoice.issued", invoice.ID, requestID); err != nil {
 			return err
 		}
-		return s.Outbox.Enqueue(writeCtx, tx, actor.TenantID, "invoice.issued", invoice.ID)
+		return s.Outbox.Enqueue(ctx, tx, actor.TenantID, "invoice.issued", invoice.ID)
 	})
 	if err != nil {
 		return domain.Invoice{}, err

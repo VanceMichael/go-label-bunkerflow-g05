@@ -1,17 +1,12 @@
 package billing
 
 import (
-	"context"
 	"fmt"
 	"sort"
 	"time"
 
 	"github.com/VanceMichael/go-base-bunkerflow-g05/internal/domain"
 )
-
-func detachedInvoiceContext(context.Context) context.Context {
-	return context.Background()
-}
 
 type StatementLine struct {
 	InvoiceID   string
