@@ -81,7 +81,7 @@ func (s *Service) Pay(ctx context.Context, actor domain.Actor, invoiceID, paymen
 	}
 	var amount int64
 	var state, storedKey string
-	if err := s.Store.DB.QueryRowContext(ctx, `SELECT amount_cents,state,COALESCE(payment_key,'') FROM invoices i JOIN transfer_orders o ON o.id=i.order_id WHERE i.id=? AND o.tenant_id=?`, invoiceID, actor.TenantID).Scan(&amount, &state, &storedKey); err == sql.ErrNoRows {
+	if err := s.Store.DB.QueryRowContext(ctx, `SELECT i.amount_cents,i.state,COALESCE(payment_key,'') FROM invoices i JOIN transfer_orders o ON o.id=i.order_id WHERE i.id=? AND o.tenant_id=?`, invoiceID, actor.TenantID).Scan(&amount, &state, &storedKey); err == sql.ErrNoRows {
 		return domain.ErrNotFound
 	} else if err != nil {
 		return err
