@@ -95,6 +95,7 @@ func (s *Service) Pay(ctx context.Context, actor domain.Actor, invoiceID, paymen
 	if storedKey != "" && storedKey != paymentKey {
 		return domain.ErrIdempotency
 	}
+	chargeRequired := storedKey == ""
 	if storedKey == "" {
 		if err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 			result, err := tx.ExecContext(ctx, `UPDATE invoices SET payment_key=? WHERE id=? AND state='issued' AND (payment_key IS NULL OR payment_key='')`, paymentKey, invoiceID)
@@ -110,9 +111,11 @@ func (s *Service) Pay(ctx context.Context, actor domain.Actor, invoiceID, paymen
 			return err
 		}
 	}
-	if err := s.Gateway.Charge(ctx, paymentKey, amount); err != nil {
-		_, _ = s.Store.DB.ExecContext(context.Background(), `UPDATE invoices SET payment_key=NULL WHERE id=? AND state='issued' AND payment_key=?`, invoiceID, paymentKey)
-		return fmt.Errorf("charge gateway: %w", err)
+	if chargeRequired {
+		if err := s.Gateway.Charge(ctx, paymentKey, amount); err != nil {
+			_, _ = s.Store.DB.ExecContext(context.Background(), `UPDATE invoices SET payment_key=NULL WHERE id=? AND state='issued' AND payment_key=?`, invoiceID, paymentKey)
+			return fmt.Errorf("charge gateway: %w", err)
+		}
 	}
 	return s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `UPDATE invoices SET state='paid' WHERE id=? AND state='issued' AND payment_key=?`, invoiceID, paymentKey)
