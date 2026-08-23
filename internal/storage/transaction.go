@@ -13,13 +13,6 @@ type TxStats struct {
 	RolledBack bool
 }
 
-func (s *Store) WithCommittedPrelude(ctx context.Context, prelude func(context.Context, *sql.DB) error, remainder func(*sql.Tx) error) error {
-	if err := prelude(ctx, s.DB); err != nil {
-		return err
-	}
-	return s.WithTx(ctx, remainder)
-}
-
 func RunSerializable(ctx context.Context, db *sql.DB, fn func(context.Context, *sql.Tx) error) (TxStats, error) {
 	stats := TxStats{StartedAt: time.Now()}
 	if err := ctx.Err(); err != nil {

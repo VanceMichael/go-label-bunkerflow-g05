@@ -27,9 +27,9 @@ func (s *Service) Open(ctx context.Context, actor domain.Actor, orderID, severit
 		return domain.Incident{}, domain.ErrInvalid
 	}
 	item := domain.Incident{ID: uuid.NewString(), TenantID: actor.TenantID, OrderID: orderID, Severity: severity, Status: "open", Summary: summary}
-	err := s.Store.WithCommittedPrelude(ctx, func(ctx context.Context, db *sql.DB) error {
+	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		var state string
-		if err := db.QueryRowContext(ctx, `SELECT state FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&state); err == sql.ErrNoRows {
+		if err := tx.QueryRowContext(ctx, `SELECT state FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&state); err == sql.ErrNoRows {
 			return domain.ErrNotFound
 		} else if err != nil {
 			return err
@@ -37,12 +37,12 @@ func (s *Service) Open(ctx context.Context, actor domain.Actor, orderID, severit
 		if state != "transferring" {
 			return fmt.Errorf("%w: order not transferring", domain.ErrConflict)
 		}
-		if _, err := db.ExecContext(ctx, `INSERT INTO incidents(id,tenant_id,order_id,severity,status,summary,created_at) VALUES (?,?,?,?,?,?,?)`, item.ID, item.TenantID, item.OrderID, item.Severity, item.Status, item.Summary, storage.StringTime(time.Now())); err != nil {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO incidents(id,tenant_id,order_id,severity,status,summary,created_at) VALUES (?,?,?,?,?,?,?)`, item.ID, item.TenantID, item.OrderID, item.Severity, item.Status, item.Summary, storage.StringTime(time.Now())); err != nil {
 			return err
 		}
-		_, err := db.ExecContext(ctx, `UPDATE transfer_orders SET state='cancelled',version=version+1 WHERE id=? AND tenant_id=? AND state='transferring'`, orderID, actor.TenantID)
-		return err
-	}, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `UPDATE transfer_orders SET state='cancelled',version=version+1 WHERE id=? AND tenant_id=? AND state='transferring'`, orderID, actor.TenantID); err != nil {
+			return err
+		}
 		if err := s.Audit.Record(ctx, tx, actor, "incident.opened", item.ID, requestID); err != nil {
 			return err
 		}
