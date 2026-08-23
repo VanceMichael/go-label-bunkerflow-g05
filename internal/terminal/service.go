@@ -36,7 +36,7 @@ func (s *Service) Get(ctx context.Context, actor domain.Actor, id string) (domai
 
 func (s *Service) Archive(ctx context.Context, actor domain.Actor, id string) error {
 	var active int
-	err := s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM bunker_windows w LEFT JOIN outbox_messages o ON o.tenant_id=w.tenant_id AND o.status='pending' WHERE w.terminal_id=? AND w.status NOT IN ('cancelled','released')`, id).Scan(&active)
+	err := s.Store.DB.QueryRowContext(ctx, `SELECT COUNT(*) FROM bunker_windows w LEFT JOIN transfer_orders o ON o.window_id=w.id AND o.state NOT IN ('completed','cancelled') WHERE w.terminal_id=? AND (w.status NOT IN ('cancelled','released') OR o.lease_until>? OR EXISTS (SELECT 1 FROM outbox_messages m WHERE m.tenant_id=w.tenant_id AND m.status='pending'))`, id, storage.StringTime(time.Now())).Scan(&active)
 	if err != nil {
 		return err
 	}
