@@ -283,28 +283,36 @@ func (s *Service) Complete(ctx context.Context, actor domain.Actor, orderID stri
 }
 
 func (s *Service) Abort(ctx context.Context, actor domain.Actor, orderID, requestID string) error {
-	var preLot string
-	var preTarget float64
-	if err := s.Store.DB.QueryRowContext(ctx, `SELECT fuel_lot_id,target_kg FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&preLot, &preTarget); err != nil {
-		return err
-	}
-	if _, err := s.Store.DB.ExecContext(ctx, `UPDATE fuel_lots SET available_kg=available_kg+? WHERE id=? AND tenant_id=?`, preTarget, preLot, actor.TenantID); err != nil {
-		return err
-	}
 	return s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		var state, lot string
-		var target float64
-		if err := tx.QueryRowContext(ctx, `SELECT state, fuel_lot_id, target_kg FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&state, &lot, &target); err != nil {
+		var target, transferred float64
+		if err := tx.QueryRowContext(ctx, `SELECT state, fuel_lot_id, target_kg, transferred_kg FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&state, &lot, &target, &transferred); err == sql.ErrNoRows {
+			return domain.ErrNotFound
+		} else if err != nil {
 			return err
 		}
 		current := domain.OperationState(state)
 		if current == domain.StateCompleted || current == domain.StateCancelled {
-			return domain.ErrConflict
+			return fmt.Errorf("%w: terminal state %s", domain.ErrConflict, current)
 		}
-		_ = lot
-		_ = target
-		if _, err := tx.ExecContext(ctx, `UPDATE transfer_orders SET state='cancelled', lease_owner=NULL, lease_until=NULL, version=version+1 WHERE id=? AND tenant_id=?`, orderID, actor.TenantID); err != nil {
+		// Fuel was only reserved once the order entered the transferring state;
+		// compensate the untransferred remainder so pre-transfer aborts do not
+		// inflate available capacity.
+		if current == domain.StateTransferring {
+			release := target - transferred
+			if release > 0 {
+				if err := s.Fuel.Release(ctx, tx, actor, lot, release); err != nil {
+					return err
+				}
+			}
+		}
+		result, err := tx.ExecContext(ctx, `UPDATE transfer_orders SET state='cancelled', lease_owner=NULL, lease_until=NULL, version=version+1 WHERE id=? AND tenant_id=? AND state=?`, orderID, actor.TenantID, state)
+		if err != nil {
 			return err
+		}
+		n, _ := result.RowsAffected()
+		if n != 1 {
+			return fmt.Errorf("%w: abort transition", domain.ErrConflict)
 		}
 		if err := s.Audit.Record(ctx, tx, actor, "bunkering.cancelled", orderID, requestID); err != nil {
 			return err
