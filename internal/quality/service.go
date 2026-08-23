@@ -38,41 +38,7 @@ func (s *Service) ReceiveSamples(ctx context.Context, actor domain.Actor, orderI
 		seen[input.ChainRef] = struct{}{}
 		items = append(items, domain.Sample{ID: uuid.NewString(), OrderID: orderID, ChainRef: input.ChainRef, Receiver: input.Receiver, State: domain.QualityReceived})
 	}
-	if s.Store.Hooks.SamplesPrelude == nil {
-		err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
-			var tenantID string
-			if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&tenantID); err == sql.ErrNoRows {
-				return domain.ErrNotFound
-			} else if err != nil {
-				return err
-			}
-			for _, item := range items {
-				if _, err := tx.ExecContext(ctx, `INSERT INTO samples(id, order_id, chain_ref, receiver, quality_state, created_at) VALUES (?, ?, ?, ?, ?, ?)`, item.ID, item.OrderID, item.ChainRef, item.Receiver, item.State, storage.StringTime(time.Now())); err != nil {
-					return fmt.Errorf("insert sample: %w", err)
-				}
-				if _, err := tx.ExecContext(ctx, `INSERT INTO custody_events(id, sample_id, actor_id, action, created_at) VALUES (?, ?, ?, 'received', ?)`, uuid.NewString(), item.ID, actor.ID, storage.StringTime(time.Now())); err != nil {
-					return err
-				}
-			}
-			if err := s.Audit.Record(ctx, tx, actor, "samples.received", orderID, requestID); err != nil {
-				return err
-			}
-			return nil
-		})
-		if err != nil {
-			return nil, err
-		}
-		return items, nil
-	}
-	err := s.Store.WithCommittedPrelude(ctx, func(ctx context.Context, db *sql.DB) error {
-		for _, item := range items {
-			if _, err := db.ExecContext(ctx, `INSERT INTO samples(id,order_id,chain_ref,receiver,quality_state,created_at) VALUES (?,?,?,?,?,?)`, item.ID, item.OrderID, item.ChainRef, item.Receiver, item.State, storage.StringTime(time.Now())); err != nil {
-				return fmt.Errorf("insert sample: %w", err)
-			}
-		}
-		close(s.Store.Hooks.SamplesPrelude)
-		return nil
-	}, func(tx *sql.Tx) error {
+	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		var tenantID string
 		if err := tx.QueryRowContext(ctx, `SELECT tenant_id FROM transfer_orders WHERE id=? AND tenant_id=?`, orderID, actor.TenantID).Scan(&tenantID); err == sql.ErrNoRows {
 			return domain.ErrNotFound
@@ -80,9 +46,20 @@ func (s *Service) ReceiveSamples(ctx context.Context, actor domain.Actor, orderI
 			return err
 		}
 		for _, item := range items {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO samples(id, order_id, chain_ref, receiver, quality_state, created_at) VALUES (?, ?, ?, ?, ?, ?)`, item.ID, item.OrderID, item.ChainRef, item.Receiver, item.State, storage.StringTime(time.Now())); err != nil {
+				return fmt.Errorf("insert sample: %w", err)
+			}
 			if _, err := tx.ExecContext(ctx, `INSERT INTO custody_events(id, sample_id, actor_id, action, created_at) VALUES (?, ?, ?, 'received', ?)`, uuid.NewString(), item.ID, actor.ID, storage.StringTime(time.Now())); err != nil {
 				return err
 			}
+		}
+		// SamplesPrelude is a synchronization seam for tests; it must be
+		// signalled inside the transaction so a reader that observes the
+		// samples also observes the matching custody handover. Signalling
+		// outside (or before audit) breaks atomicity and leaves samples
+		// whose custody records never committed.
+		if s.Store.Hooks.SamplesPrelude != nil {
+			close(s.Store.Hooks.SamplesPrelude)
 		}
 		if err := s.Audit.Record(ctx, tx, actor, "samples.received", orderID, requestID); err != nil {
 			return err
