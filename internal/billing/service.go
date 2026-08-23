@@ -80,8 +80,8 @@ func (s *Service) Pay(ctx context.Context, actor domain.Actor, invoiceID, paymen
 		return domain.ErrInvalid
 	}
 	var amount int64
-	var state string
-	if err := s.Store.DB.QueryRowContext(ctx, `SELECT amount_cents,state FROM invoices i JOIN transfer_orders o ON o.id=i.order_id WHERE i.id=? AND o.tenant_id=?`, invoiceID, actor.TenantID).Scan(&amount, &state); err == sql.ErrNoRows {
+	var state, storedKey string
+	if err := s.Store.DB.QueryRowContext(ctx, `SELECT amount_cents,state,COALESCE(payment_key,'') FROM invoices i JOIN transfer_orders o ON o.id=i.order_id WHERE i.id=? AND o.tenant_id=?`, invoiceID, actor.TenantID).Scan(&amount, &state, &storedKey); err == sql.ErrNoRows {
 		return domain.ErrNotFound
 	} else if err != nil {
 		return err
@@ -92,11 +92,30 @@ func (s *Service) Pay(ctx context.Context, actor domain.Actor, invoiceID, paymen
 	if state != "issued" {
 		return domain.ErrConflict
 	}
+	if storedKey != "" && storedKey != paymentKey {
+		return domain.ErrIdempotency
+	}
+	if storedKey == "" {
+		if err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+			result, err := tx.ExecContext(ctx, `UPDATE invoices SET payment_key=? WHERE id=? AND state='issued' AND (payment_key IS NULL OR payment_key='')`, paymentKey, invoiceID)
+			if err != nil {
+				return err
+			}
+			n, _ := result.RowsAffected()
+			if n != 1 {
+				return domain.ErrConflict
+			}
+			return nil
+		}); err != nil {
+			return err
+		}
+	}
 	if err := s.Gateway.Charge(ctx, paymentKey, amount); err != nil {
+		_, _ = s.Store.DB.ExecContext(context.Background(), `UPDATE invoices SET payment_key=NULL WHERE id=? AND state='issued' AND payment_key=?`, invoiceID, paymentKey)
 		return fmt.Errorf("charge gateway: %w", err)
 	}
 	return s.Store.WithTx(ctx, func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(ctx, `UPDATE invoices SET state='paid',payment_key=? WHERE id=? AND state='issued'`, paymentKey, invoiceID)
+		result, err := tx.ExecContext(ctx, `UPDATE invoices SET state='paid' WHERE id=? AND state='issued' AND payment_key=?`, invoiceID, paymentKey)
 		if err != nil {
 			return err
 		}
