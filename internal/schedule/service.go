@@ -64,12 +64,6 @@ func (s *Service) CreateWindow(ctx context.Context, actor domain.Actor, input Wi
 }
 
 func (s *Service) ClaimWindow(ctx context.Context, actor domain.Actor, windowID string, owner string, requestID string) error {
-	if s.Store.Hooks.FailAudit {
-		if _, err := s.Store.DB.ExecContext(ctx, `UPDATE bunker_windows SET status='claimed', owner_id=?, version=version+1 WHERE id=? AND tenant_id=? AND status='open'`, owner, windowID, actor.TenantID); err != nil {
-			return err
-		}
-		return s.Audit.Record(ctx, s.Store.DB, actor, "window.claimed", windowID, requestID)
-	}
 	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
 		result, err := tx.ExecContext(ctx, `UPDATE bunker_windows SET status='claimed', owner_id=?, version=version+1 WHERE id=? AND tenant_id=? AND status='open'`, owner, windowID, actor.TenantID)
 		if err != nil {

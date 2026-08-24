@@ -2,6 +2,7 @@ package schedule
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"sync"
 	"testing"
@@ -41,6 +42,33 @@ func TestCreateWindowIsAtomicWhenAuditFails(t *testing.T) {
 	}
 	if count != 0 {
 		t.Fatalf("windows = %d", count)
+	}
+}
+
+func TestClaimWindowRollsBackStateWhenAuditFails(t *testing.T) {
+	svc, actor, closeFn := scheduleFixture(t)
+	defer closeFn()
+	item, err := svc.CreateWindow(context.Background(), actor, WindowInput{TerminalID: "terminal-1", StartsAt: time.Now().Add(time.Hour), EndsAt: time.Now().Add(2 * time.Hour)}, "req-prep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.Store.Hooks.FailAudit = true
+	if err := svc.ClaimWindow(context.Background(), actor, item.ID, "dispatcher-1", "req-claim-1"); !errors.Is(err, domain.ErrUnavailable) {
+		t.Fatalf("claim error = %v, want ErrUnavailable", err)
+	}
+	var status, ownerID sql.NullString
+	if err := svc.Store.DB.QueryRow(`SELECT status, owner_id FROM bunker_windows WHERE id=?`, item.ID).Scan(&status, &ownerID); err != nil {
+		t.Fatal(err)
+	}
+	if status.String != "open" {
+		t.Fatalf("status = %q, want open", status.String)
+	}
+	if ownerID.Valid {
+		t.Fatalf("owner_id = %q, want unclaimed", ownerID.String)
+	}
+	svc.Store.Hooks.FailAudit = false
+	if err := svc.ClaimWindow(context.Background(), actor, item.ID, "dispatcher-1", "req-claim-1"); err != nil {
+		t.Fatalf("retry claim error = %v", err)
 	}
 }
 
