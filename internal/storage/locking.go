@@ -15,8 +15,12 @@ type Lock struct {
 	Until time.Time
 }
 
-func RenewOrderLeaseUnchecked(ctx context.Context, db *sql.DB, orderID, tenantID string, now, until time.Time) (sql.Result, error) {
-	return db.ExecContext(ctx, `UPDATE transfer_orders SET lease_until=?, version=version+1 WHERE id=? AND tenant_id=? AND state='transferring' AND lease_until>?`, StringTime(until), orderID, tenantID, StringTime(now))
+// RenewOrderLease extends the active lease held by owner until the given time.
+// The owner predicate is mandatory: without it a previous holder whose lease was
+// taken over could renew after the fact and silently overwrite the new holder's
+// lease_until, defeating the ownership control of a takeover.
+func RenewOrderLease(ctx context.Context, db *sql.DB, orderID, tenantID, owner string, now, until time.Time) (sql.Result, error) {
+	return db.ExecContext(ctx, `UPDATE transfer_orders SET lease_until=?, version=version+1 WHERE id=? AND tenant_id=? AND lease_owner=? AND state='transferring' AND lease_until>?`, StringTime(until), orderID, tenantID, owner, StringTime(now))
 }
 
 func AcquireRow(ctx context.Context, tx *sql.Tx, table, id, owner string, now time.Time, ttl time.Duration) error {

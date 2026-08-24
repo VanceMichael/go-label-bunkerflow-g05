@@ -191,8 +191,11 @@ func (s *Service) transition(ctx context.Context, actor domain.Actor, id string,
 }
 
 func (s *Service) RenewLease(ctx context.Context, actor domain.Actor, orderID, owner string, now time.Time) error {
+	if owner == "" {
+		return domain.ErrInvalid
+	}
 	until := now.Add(5 * time.Minute)
-	result, err := storage.RenewOrderLeaseUnchecked(ctx, s.Store.DB, orderID, actor.TenantID, now, until)
+	result, err := storage.RenewOrderLease(ctx, s.Store.DB, orderID, actor.TenantID, owner, now, until)
 	if err != nil {
 		return err
 	}
