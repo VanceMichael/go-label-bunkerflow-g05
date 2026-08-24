@@ -32,54 +32,45 @@ func (s *Service) CreateWindow(ctx context.Context, actor domain.Actor, input Wi
 		return domain.BunkerWindow{}, domain.ErrInvalid
 	}
 	item := domain.BunkerWindow{ID: uuid.NewString(), TenantID: actor.TenantID, TerminalID: input.TerminalID, StartsAt: input.StartsAt, EndsAt: input.EndsAt, Status: "open", Version: 1}
-	if s.Store.Hooks.WindowPrelude == nil {
-		err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
-			var terminalStatus string
-			if err := tx.QueryRowContext(ctx, `SELECT status FROM terminals WHERE id=? AND tenant_id=?`, input.TerminalID, actor.TenantID).Scan(&terminalStatus); err == sql.ErrNoRows {
-				return domain.ErrNotFound
-			} else if err != nil {
-				return err
-			}
-			if terminalStatus != "active" {
-				return domain.ErrConflict
-			}
-			var conflict int
-			if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM bunker_windows WHERE terminal_id=? AND status='open' AND starts_at<? AND ends_at>?`, input.TerminalID, storage.StringTime(input.EndsAt), storage.StringTime(input.StartsAt)).Scan(&conflict); err != nil {
-				return err
-			}
-			if conflict != 0 {
-				return fmt.Errorf("%w: overlapping window", domain.ErrConflict)
-			}
-			if _, err := tx.ExecContext(ctx, `INSERT INTO bunker_windows(id, tenant_id, terminal_id, starts_at, ends_at, status, version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.TenantID, item.TerminalID, storage.StringTime(item.StartsAt), storage.StringTime(item.EndsAt), item.Status, item.Version, storage.StringTime(time.Now())); err != nil {
-				return err
-			}
-			if err := s.Audit.Record(ctx, tx, actor, "window.created", item.ID, requestID); err != nil {
-				return err
-			}
-			return s.Outbox.Enqueue(ctx, tx, actor.TenantID, "window.created", item.ID)
-		})
-		if err != nil {
-			return domain.BunkerWindow{}, err
+	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+		var terminalStatus string
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM terminals WHERE id=? AND tenant_id=?`, input.TerminalID, actor.TenantID).Scan(&terminalStatus); err == sql.ErrNoRows {
+			return domain.ErrNotFound
+		} else if err != nil {
+			return err
 		}
-		return item, nil
-	}
-	if _, err := s.Store.DB.ExecContext(ctx, `INSERT INTO bunker_windows(id, tenant_id, terminal_id, starts_at, ends_at, status, version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.TenantID, item.TerminalID, storage.StringTime(item.StartsAt), storage.StringTime(item.EndsAt), item.Status, item.Version, storage.StringTime(time.Now())); err != nil {
-		return domain.BunkerWindow{}, err
-	}
-	close(s.Store.Hooks.WindowPrelude)
-	if s.Store.Hooks.WindowRelease != nil {
-		select {
-		case <-s.Store.Hooks.WindowRelease:
-		case <-ctx.Done():
-			return domain.BunkerWindow{}, ctx.Err()
+		if terminalStatus != "active" {
+			return domain.ErrConflict
 		}
-	}
-	if err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+		var conflict int
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM bunker_windows WHERE terminal_id=? AND status='open' AND starts_at<? AND ends_at>?`, input.TerminalID, storage.StringTime(input.EndsAt), storage.StringTime(input.StartsAt)).Scan(&conflict); err != nil {
+			return err
+		}
+		if conflict != 0 {
+			return fmt.Errorf("%w: overlapping window", domain.ErrConflict)
+		}
+		if _, err := tx.ExecContext(ctx, `INSERT INTO bunker_windows(id, tenant_id, terminal_id, starts_at, ends_at, status, version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.TenantID, item.TerminalID, storage.StringTime(item.StartsAt), storage.StringTime(item.EndsAt), item.Status, item.Version, storage.StringTime(time.Now())); err != nil {
+			return err
+		}
+		// Coordinate observers on the in-progress insert, but stay inside the
+		// transaction so a later audit/outbox failure rolls the window back
+		// instead of leaving the berth slot occupied.
+		if s.Store.Hooks.WindowPrelude != nil {
+			close(s.Store.Hooks.WindowPrelude)
+			if s.Store.Hooks.WindowRelease != nil {
+				select {
+				case <-s.Store.Hooks.WindowRelease:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+		}
 		if err := s.Audit.Record(ctx, tx, actor, "window.created", item.ID, requestID); err != nil {
 			return err
 		}
 		return s.Outbox.Enqueue(ctx, tx, actor.TenantID, "window.created", item.ID)
-	}); err != nil {
+	})
+	if err != nil {
 		return domain.BunkerWindow{}, err
 	}
 	return item, nil
