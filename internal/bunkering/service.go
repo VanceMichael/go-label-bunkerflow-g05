@@ -245,8 +245,13 @@ func (s *Service) CompleteStep(ctx context.Context, actor domain.Actor, orderID 
 
 func (s *Service) Complete(ctx context.Context, actor domain.Actor, orderID string, requestID string) (domain.Invoice, error) {
 	var invoice domain.Invoice
-	snapshot, err := s.Quality.ApprovalSnapshot(ctx, orderID)
-	if err != nil {
+	var err error
+	// The snapshot is read outside the transaction only as a synchronization seam
+	// so tests can inject a concurrent quality revocation between the read and
+	// the commit via the QualityRead/QualityRelease hooks. The approval decision
+	// itself is re-evaluated inside the transaction below, so a revocation that
+	// lands in that window cannot complete and bill the order on a stale approval.
+	if _, err := s.Quality.ApprovalSnapshot(ctx, orderID); err != nil {
 		return invoice, err
 	}
 	if s.Store.Hooks.QualityRead != nil {
@@ -271,7 +276,17 @@ func (s *Service) Complete(ctx context.Context, actor domain.Actor, orderID stri
 		if state != string(domain.StateSampled) {
 			return fmt.Errorf("%w: order not sampled", domain.ErrConflict)
 		}
-		if !snapshot.Approved {
+		// Re-read approval under the same write lock that this transaction
+		// uses to advance the order and issue the invoice. This closes the
+		// window where a concurrent sample revocation (quality_state
+		// approved -> received/rejected) could have landed after the snapshot
+		// taken outside the transaction, which would otherwise let us complete
+		// and bill on a stale approval.
+		approved, err := s.Quality.ApprovedForOrder(ctx, tx, orderID)
+		if err != nil {
+			return err
+		}
+		if !approved {
 			return domain.ErrNoQuality
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE transfer_orders SET state='completed', lease_owner=NULL, lease_until=NULL, transferred_kg=? WHERE id=? AND tenant_id=? AND state='sampled'`, target, orderID, actor.TenantID); err != nil {
