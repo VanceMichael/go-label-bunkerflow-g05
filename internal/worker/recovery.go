@@ -21,7 +21,7 @@ func (r *Recovery) Replay(ctx context.Context, actor domain.Actor, orderID strin
 		if state != "cancelled" {
 			return fmt.Errorf("%w: only cancelled operations can be recovered", domain.ErrConflict)
 		}
-		if err := replayFromBeginning(ctx, tx, orderID); err != nil {
+		if err := resumeFromCheckpoint(ctx, tx, orderID); err != nil {
 			return err
 		}
 		if _, err := tx.ExecContext(ctx, `UPDATE transfer_orders SET state='planned',version=version+1 WHERE id=? AND tenant_id=?`, orderID, actor.TenantID); err != nil {
