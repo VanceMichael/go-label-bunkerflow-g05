@@ -175,7 +175,7 @@ func (s *Service) transition(ctx context.Context, actor domain.Actor, id string,
 		return err
 	}
 	return s.Store.WithTx(ctx, func(tx *sql.Tx) error {
-		result, err := storage.MoveOrderWithoutSource(ctx, tx, id, actor.TenantID, to)
+		result, err := storage.MoveOrder(ctx, tx, id, actor.TenantID, from, to)
 		if err != nil {
 			return err
 		}

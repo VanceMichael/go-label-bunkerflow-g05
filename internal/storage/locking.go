@@ -15,8 +15,13 @@ type Lock struct {
 	Until time.Time
 }
 
-func MoveOrderWithoutSource(ctx context.Context, tx *sql.Tx, id, tenantID string, to domain.OperationState) (sql.Result, error) {
-	return tx.ExecContext(ctx, `UPDATE transfer_orders SET state=?, version=version+1 WHERE id=? AND tenant_id=?`, to, id, tenantID)
+// MoveOrder transitions a transfer order from one state to another. The
+// source state is guarded in the WHERE clause so the update is a no-op (and
+// surfaces a conflict) when the row is not currently in the expected source
+// state. This prevents transitions such as planned -> alongside from being
+// applied to orders that have not yet satisfied their prerequisites.
+func MoveOrder(ctx context.Context, tx *sql.Tx, id, tenantID string, from, to domain.OperationState) (sql.Result, error) {
+	return tx.ExecContext(ctx, `UPDATE transfer_orders SET state=?, version=version+1 WHERE id=? AND tenant_id=? AND state=?`, to, id, tenantID, from)
 }
 
 func AcquireRow(ctx context.Context, tx *sql.Tx, table, id, owner string, now time.Time, ttl time.Duration) error {
