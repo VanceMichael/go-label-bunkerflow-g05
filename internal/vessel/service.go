@@ -35,17 +35,19 @@ func (s *Service) Register(ctx context.Context, actor domain.Actor, input Regist
 		return domain.Vessel{}, fmt.Errorf("%w: certificate", domain.ErrConflict)
 	}
 	item := domain.Vessel{ID: uuid.NewString(), TenantID: actor.TenantID, IMO: domain.NormalizeIMO(input.IMO), Name: input.Name, Flag: input.Flag, DeadweightT: input.DeadweightKG, Status: "active", Certificate: domain.Certificate{Number: input.CertificateNumber, ExpiresAt: input.ExpiresAt, Verified: input.Verified}}
-	err := s.Store.WithCommittedPrelude(ctx, func(ctx context.Context, db *sql.DB) error {
-		_, err := db.ExecContext(ctx, `INSERT INTO vessels(id, tenant_id, imo, name, flag, deadweight_kg, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.TenantID, item.IMO, item.Name, item.Flag, item.DeadweightT, item.Status, storage.StringTime(time.Now()))
-		return err
-	}, func(tx *sql.Tx) error {
+	err := s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+		// All three writes (vessel, certificate, audit) share a single
+		// transaction so that an audit or certificate failure rolls back the
+		// vessel row too. A prelude-then-remainder split would commit the vessel
+		// before the certificate/audit ran, leaving a half-registered record that
+		// the unique IMO constraint then blocked the caller from retrying.
+		if _, err := tx.ExecContext(ctx, `INSERT INTO vessels(id, tenant_id, imo, name, flag, deadweight_kg, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, item.ID, item.TenantID, item.IMO, item.Name, item.Flag, item.DeadweightT, item.Status, storage.StringTime(time.Now())); err != nil {
+			return err
+		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO vessel_certificates(id, vessel_id, number, expires_at, verified, created_at) VALUES (?, ?, ?, ?, ?, ?)`, uuid.NewString(), item.ID, item.Certificate.Number, storage.StringTime(item.Certificate.ExpiresAt), 1, storage.StringTime(time.Now())); err != nil {
 			return err
 		}
-		if err := s.Audit.Record(ctx, tx, actor, "vessel.registered", item.ID, requestID); err != nil {
-			return err
-		}
-		return nil
+		return s.Audit.Record(ctx, tx, actor, "vessel.registered", item.ID, requestID)
 	})
 	if err != nil {
 		return domain.Vessel{}, err
