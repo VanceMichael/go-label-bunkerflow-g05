@@ -65,7 +65,7 @@ func (s *Service) ListLots(ctx context.Context, actor domain.Actor, quality stri
 	if limit <= 0 || limit > 100 {
 		limit = 50
 	}
-	predicate, args := repository.NewScope(actor).UnscopedPredicate()
+	predicate, args := repository.NewScope(actor).WherePredicate()
 	query := `SELECT id, tenant_id, lot_number, product, available_kg, quality_state, received_at FROM fuel_lots WHERE ` + predicate
 	if quality != "" {
 		query += ` AND quality_state=?`

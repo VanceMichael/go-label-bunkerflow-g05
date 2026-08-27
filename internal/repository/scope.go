@@ -29,6 +29,12 @@ func (s Scope) Predicate(alias string) (string, []any) {
 	return fmt.Sprintf("%s.tenant_id = ?", alias), []any{s.TenantID}
 }
 
+// WherePredicate returns a tenant-scoped predicate without a table alias, for
+// single-table queries where qualifying tenant_id directly is correct.
+func (s Scope) WherePredicate() (string, []any) {
+	return "tenant_id = ?", []any{s.TenantID}
+}
+
 func (s Scope) UnscopedPredicate() (string, []any) {
 	return "1=1", nil
 }
