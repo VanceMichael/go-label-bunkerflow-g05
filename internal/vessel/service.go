@@ -57,26 +57,22 @@ func (s *Service) ReplaceCertificate(ctx context.Context, actor domain.Actor, ve
 	if !verified || !expires.After(time.Now()) {
 		return fmt.Errorf("%w: certificate", domain.ErrConflict)
 	}
-	err := s.Store.WithTx(context.Background(), func(tx *sql.Tx) error {
-		result, err := tx.ExecContext(context.Background(), `UPDATE vessels SET status='active' WHERE id=? AND tenant_id=?`, vesselID, actor.TenantID)
+	return s.Store.WithTx(ctx, func(tx *sql.Tx) error {
+		result, err := tx.ExecContext(ctx, `UPDATE vessels SET status='active' WHERE id=? AND tenant_id=?`, vesselID, actor.TenantID)
 		if err != nil {
 			return err
 		}
 		if n, _ := result.RowsAffected(); n != 1 {
 			return domain.ErrNotFound
 		}
-		if _, err := tx.ExecContext(context.Background(), `UPDATE vessel_certificates SET number=?, expires_at=?, verified=? WHERE vessel_id=?`, number, storage.StringTime(expires), 1, vesselID); err != nil {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("%w: %v", domain.ErrCancelled, err)
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE vessel_certificates SET number=?, expires_at=?, verified=? WHERE vessel_id=?`, number, storage.StringTime(expires), 1, vesselID); err != nil {
 			return err
 		}
-		return s.Audit.Record(context.Background(), tx, actor, "vessel.certificate.replaced", vesselID, requestID)
+		return s.Audit.Record(ctx, tx, actor, "vessel.certificate.replaced", vesselID, requestID)
 	})
-	if err != nil {
-		return err
-	}
-	if err := ctx.Err(); err != nil {
-		return fmt.Errorf("%w: %v", domain.ErrCancelled, err)
-	}
-	return nil
 }
 
 func (s *Service) Get(ctx context.Context, actor domain.Actor, vesselID string) (domain.Vessel, error) {
